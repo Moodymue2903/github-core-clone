@@ -45,7 +45,9 @@ const CODE_TYPE: Record<number, string> = { 1: 'commit', 2: 'tree', 3: 'blob', 4
 
 function encodePackObject(type: string, data: Buffer): Buffer {
   const code = TYPE_CODE[type];
-  const compressed = deflateSync(data);
+  // Fastest compression level: packfile writes are on the hot path for
+  // clone/fetch, and the ~15% larger output is cheap on a local socket.
+  const compressed = deflateSync(data, { level: 1 });
   // varint header: low 4 bits size, then 7-bit chunks, type in bits 4-6 of first byte
   let size = data.length;
   const header: number[] = [];
@@ -134,9 +136,22 @@ export function applyDelta(base: Buffer, delta: Buffer): Buffer {
 
 export interface ReadPackResult { objects: Map<string, PackObject>; deltaCount: number; }
 
-// Smallest prefix length >= start that inflates cleanly. inflateSync ignores
-// trailing bytes, so the first length that succeeds is the true stream end.
+// Decompress one zlib object starting at `start` and return the data plus
+// the offset just past the stream. A single inflateSync with info:true
+// reports exactly how many compressed bytes it consumed
+// (engine.bytesWritten), so one decompression replaces the old binary
+// search that re-inflated the object ~log2(pack) times. Falls back to
+// the binary search if the engine does not report a usable length.
 function inflateEnd(pack: Buffer, start: number): { data: Buffer; next: number } {
+  try {
+    const { buffer, engine } = inflateSync(pack.subarray(start), { info: true }) as unknown as { buffer: Buffer; engine: { bytesWritten?: number } };
+    const used = engine?.bytesWritten;
+    if (typeof used === 'number' && used > 0 && start + used <= pack.length) {
+      return { data: buffer, next: start + used };
+    }
+  } catch {
+    // fall through to the binary search below
+  }
   let lo = start;
   let hi = pack.length;
   while (lo < hi) {

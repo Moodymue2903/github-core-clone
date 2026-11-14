@@ -215,6 +215,11 @@ function computeFetch(store: Store, repo: Repo, wants: string[], haves: string[]
   // has the boundary commit but not its parents, and a deepen fetch must be
   // able to send those parents even though they are reachable from the have.
   const haveReachable = new Set<string>();
+  // Batch the non-shallow haves into one walk: reachable() already takes
+  // several start shas and visits each object once, so one call replaces
+  // a full graph walk per have. Shallow-boundary haves stay per-have
+  // (they contribute only the boundary commit plus its tree, not ancestors).
+  const plainHaves: string[] = [];
   for (const h of haves) {
     if (shallowReq.includes(h)) {
       const obj = repo.objects.get(h);
@@ -223,12 +228,13 @@ function computeFetch(store: Store, repo: Repo, wants: string[], haves: string[]
         const c = parseCommit(obj.data);
         for (const s of store.reachable(repo, [c.tree])) haveReachable.add(s);
       } else {
-        for (const s of store.reachable(repo, [h])) haveReachable.add(s);
+        plainHaves.push(h);
       }
     } else {
-      for (const s of store.reachable(repo, [h])) haveReachable.add(s);
+      plainHaves.push(h);
     }
   }
+  if (plainHaves.length) for (const s of store.reachable(repo, plainHaves)) haveReachable.add(s);
   // Shallow boundary: commits at depth boundary are sent without their parents.
   let wantedReachable = new Set<string>();
   const shallow = new Set<string>();
@@ -252,19 +258,24 @@ function computeFetch(store: Store, repo: Repo, wants: string[], haves: string[]
       }
       frontier = next;
     }
-    for (const sha of seen) for (const s of store.reachable(repo, [sha])) wantedReachable.add(s);
+    // One walk from every commit in the depth window: reachable() visits
+    // each object once, instead of a full graph walk per commit.
+    for (const s of store.reachable(repo, [...seen])) wantedReachable.add(s);
     // Remove anything reachable from a shallow boundary's parents (they are cut).
+    const cutParents: string[] = [];
     for (const s of shallow) {
       const obj = repo.objects.get(s);
       if (obj?.type === 'commit') {
         const c = parseCommit(obj.data);
-        for (const p of c.parents) for (const x of store.reachable(repo, [p])) wantedReachable.delete(x);
+        for (const p of c.parents) cutParents.push(p);
       }
     }
+    if (cutParents.length) for (const x of store.reachable(repo, cutParents)) wantedReachable.delete(x);
     // Unshallow: previous shallow boundaries that are now fully included.
     for (const b of shallowReq) if (seen.has(b) && !shallow.has(b)) unshallow.push(b);
   } else {
-    for (const w of wants) for (const s of store.reachable(repo, [w])) wantedReachable.add(s);
+    // One walk from all wants, not one walk per want.
+    for (const s of store.reachable(repo, wants)) wantedReachable.add(s);
     // deepen-since / deepen-not: treat like a full fetch for the checks (unused in suite).
     void deepenSince; void deepenNot;
   }
