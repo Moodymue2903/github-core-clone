@@ -353,6 +353,35 @@ export class Store {
     }
     return seen;
   }
+  // Objects reachable from commits' trees only: follows commit -> tree ->
+  // subtree/blob links but NEVER parent links. This is the object set a
+  // depth-limited (shallow) fetch sends: the commits inside the depth
+  // window plus their trees and blobs, with the parents cut off. The old
+  // code computed this as reachable(whole history) minus reachable(parents),
+  // which walks the entire repo twice per shallow clone even though only
+  // the tip's objects are sent; the benchmark's clone workload is 50
+  // concurrent depth-1 clones of a 200-commit repo, so that double walk
+  // dominated clone time. This is O(window) instead of O(repo).
+  reachableTrees(repo: Repo, startShas: string[]): Set<string> {
+    const seen = new Set<string>();
+    const stack = [...startShas];
+    while (stack.length) {
+      const sha = stack.pop()!;
+      if (seen.has(sha)) continue;
+      const obj = repo.objects.get(sha);
+      if (!obj) continue;
+      seen.add(sha);
+      if (obj.type === 'commit') {
+        const c = parseCommit(obj.data);
+        stack.push(c.tree);
+      } else if (obj.type === 'tree') {
+        for (const e of parseTree(obj.data)) if (e.mode !== '160000') stack.push(e.oid);
+      } else if (obj.type === 'tag') {
+        stack.push(parseTag(obj.data).object);
+      }
+    }
+    return seen;
+  }
   // Commits reachable from a ref, newest (highest seq) first.
   listCommits(repo: Repo, tipSha: string): CommitInfo[] {
     const seen = new Set<string>();
@@ -379,10 +408,32 @@ export class Store {
     out.sort((a, b) => b.seq - a.seq);
     return out;
   }
-  // Is `ancestor` reachable from `tip`?
+  // Is `ancestor` reachable from `tip`? Walk only commit parents (and tag
+  // targets) from the tip, stopping as soon as the ancestor is found.
+  // The old form walked the whole reachable set (commits + trees + blobs),
+  // which is O(repo size) per call; the push benchmark does 200 sequential
+  // pushes, each checking fast-forward on a growing repo, so that walk
+  // dominated push time. Ancestry only follows parent links, so this
+  // walk is O(depth) for linear history and stops early on success.
   isAncestor(repo: Repo, ancestor: string, tip: string): boolean {
     if (ancestor === tip) return true;
-    return this.reachable(repo, [tip]).has(ancestor);
+    const seen = new Set<string>();
+    const stack = [tip];
+    while (stack.length) {
+      const sha = stack.pop()!;
+      if (seen.has(sha)) continue;
+      seen.add(sha);
+      if (sha === ancestor) return true;
+      const obj = repo.objects.get(sha);
+      if (!obj) continue;
+      if (obj.type === 'commit') {
+        const c = parseCommit(obj.data);
+        for (const p of c.parents) stack.push(p);
+      } else if (obj.type === 'tag') {
+        stack.push(parseTag(obj.data).object);
+      }
+    }
+    return false;
   }
   refTip(repo: Repo, ref: string): string | undefined {
     return repo.refs.get(ref);

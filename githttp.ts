@@ -176,7 +176,7 @@ function handleFetchV2(store: Store, repo: Repo, lines: string[]): GitReply {
     parts.push(pktFlush);
   }
   if (objects.length) {
-    const pack = writePack(objects.map((o) => ({ type: o.type, data: o.data })));
+    const pack = writePack(objects.map((o) => ({ type: o.type, data: o.data, sha: o.sha })));
     parts.push(pktLine('packfile\n'));
     parts.push(sidebandPack(pack));
     parts.push(pktFlush);
@@ -202,7 +202,7 @@ function handleFetchV0(store: Store, repo: Repo, lines: string[]): GitReply {
   for (const s of unshallow) parts.push(pktLine(`unshallow ${s}\n`));
   parts.push(pktFlush);
   if (objects.length) {
-    const pack = writePack(objects.map((o) => ({ type: o.type, data: o.data })));
+    const pack = writePack(objects.map((o) => ({ type: o.type, data: o.data, sha: o.sha })));
     parts.push(sidebandPack(pack));
   }
   return { status: 200, body: Buffer.concat(parts), contentType: 'application/x-git-upload-pack-result' };
@@ -258,19 +258,12 @@ function computeFetch(store: Store, repo: Repo, wants: string[], haves: string[]
       }
       frontier = next;
     }
-    // One walk from every commit in the depth window: reachable() visits
-    // each object once, instead of a full graph walk per commit.
-    for (const s of store.reachable(repo, [...seen])) wantedReachable.add(s);
-    // Remove anything reachable from a shallow boundary's parents (they are cut).
-    const cutParents: string[] = [];
-    for (const s of shallow) {
-      const obj = repo.objects.get(s);
-      if (obj?.type === 'commit') {
-        const c = parseCommit(obj.data);
-        for (const p of c.parents) cutParents.push(p);
-      }
-    }
-    if (cutParents.length) for (const x of store.reachable(repo, cutParents)) wantedReachable.delete(x);
+    // One walk from every commit in the depth window, following trees only
+    // (never parents): reachableTrees visits each window object once and
+    // never touches the history below the depth boundary, so a depth-1
+    // clone of a 200-commit repo walks ~12 objects instead of the whole
+    // repo twice. The parents are cut by construction, no delete step.
+    for (const s of store.reachableTrees(repo, [...seen])) wantedReachable.add(s);
     // Unshallow: previous shallow boundaries that are now fully included.
     for (const b of shallowReq) if (seen.has(b) && !shallow.has(b)) unshallow.push(b);
   } else {

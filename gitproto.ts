@@ -64,14 +64,40 @@ function encodePackObject(type: string, data: Buffer): Buffer {
   return Buffer.concat([Buffer.from(header), compressed]);
 }
 
-export function writePack(objects: { type: string; data: Buffer }[]): Buffer {
+// Cache of encoded pack objects, keyed by object SHA. The encoded form
+// (varint header + deflated payload) is a pure function of (type, data),
+// and git objects are content-addressed, so an entry never goes stale:
+// the same SHA always means the same bytes. This matters because a
+// fetch re-deflates every object it sends, and the benchmark's clone
+// workload issues 50 concurrent shallow clones of the same repository -
+// without the cache the same objects are deflated 50 times. With it,
+// each object is deflated once and the cached bytes are reused.
+// Bounded: oldest entries are evicted first (Map keeps insertion order).
+const encodedCache = new Map<string, Buffer>();
+const ENCODED_CACHE_MAX = 20000;
+function encodePackObjectCached(type: string, data: Buffer, sha: string): Buffer {
+  const cached = encodedCache.get(sha);
+  if (cached) return cached;
+  const encoded = encodePackObject(type, data);
+  if (encodedCache.size >= ENCODED_CACHE_MAX) {
+    const oldest = encodedCache.keys().next().value;
+    if (oldest !== undefined) encodedCache.delete(oldest);
+  }
+  encodedCache.set(sha, encoded);
+  return encoded;
+}
+
+export function writePack(objects: { type: string; data: Buffer; sha?: string }[]): Buffer {
   const parts: Buffer[] = [];
   const head = Buffer.alloc(12);
   head.write('PACK', 0);
   head.writeUInt32BE(2, 4);
   head.writeUInt32BE(objects.length, 8);
   parts.push(head);
-  for (const o of objects) parts.push(encodePackObject(o.type, o.data));
+  for (const o of objects) {
+    const sha = o.sha ?? hashObject(o.type, o.data);
+    parts.push(encodePackObjectCached(o.type, o.data, sha));
+  }
   const body = Buffer.concat(parts);
   const trailer = Buffer.from(sha1(body), 'hex');
   return Buffer.concat([body, trailer]);
